@@ -25,10 +25,11 @@ PORT     = 8090
 URL      = f"http://{HOST}:{PORT}/json-rpc" # API endpoint
 HEADERS  = {'Content-type': 'application/json', 'Accept': 'text/plain'}
 
-trigger_pin = 17 # Define pin number
+TRIGGER_PIN  = 17    # Define pin number
+DEBOUNCE_MS  = 50    # Debounce time in milliseconds
 
 GPIO.setmode(GPIO.BCM) # Set up GPIO mode
-GPIO.setup(trigger_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(TRIGGER_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 # JSON payload to enable LEDs
 payloadON = {
@@ -49,13 +50,58 @@ payloadOFF = {
 }
 
 
-try:
-    if TurnON:
-      response = requests.post(url, json=payloadON, timeout=5)
+# ////////////////////////////////
+# ////////// FUNCTIONS ///////////
+# ////////////////////////////////
+
+def send_to_hyperion(TurnON):
+    """Send the appropriate payload to Hyperion based on pin state."""
+    try:
+        if TurnON:
+            response = requests.post(URL, json=payloadON, headers=HEADERS, timeout=5)
+        else:
+            response = requests.post(URL, json=payloadOFF, headers=HEADERS, timeout=5)
+        response.raise_for_status()
+        result = response.json()
+        print("Response:", json.dumps(result, indent=2))
+    except requests.exceptions.RequestException as e:
+        print("Error communicating with Hyperion:", e)
+
+
+def pin_changed(channel):
+    """Callback fired by GPIO edge detection when the pin state changes."""
+    pin_state = GPIO.input(TRIGGER_PIN)
+    if pin_state == GPIO.LOW:
+        print("Pin LOW - sending ON")
+        send_to_hyperion(TurnON=True)
     else:
-      response = requests.post(url, json=payloadOFF, timeout=5)
-    response.raise_for_status()
-    result = response.json()
-    print("Response:", json.dumps(result, indent=2))
-except requests.exceptions.RequestException as e:
-    print("Error communicating with Hyperion:", e)
+        print("Pin HIGH - sending OFF")
+        send_to_hyperion(TurnON=False)
+
+
+# ////////////////////////////////
+# /////////// MAIN ///////////////
+# ////////////////////////////////
+
+try:
+    # Register edge detection callback (fires on both rising and falling edges)
+    GPIO.add_event_detect(TRIGGER_PIN, GPIO.BOTH, callback=pin_changed, bouncetime=DEBOUNCE_MS)
+
+    # Read and act on the initial pin state at startup, so we don't have to
+    # wait for the first edge transition before sending the correct payload
+    initial_state = GPIO.input(TRIGGER_PIN)
+    print("Startup pin state:", "LOW" if initial_state == GPIO.LOW else "HIGH")
+    send_to_hyperion(TurnON=(initial_state == GPIO.LOW))
+
+    print("Monitoring pin", TRIGGER_PIN, "- press Ctrl+C to exit")
+
+    # Sleep indefinitely - the GPIO callback handles everything asynchronously
+    while True:
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    print("Exiting...")
+
+finally:
+    GPIO.cleanup()
+    print("GPIO cleaned up")
