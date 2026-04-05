@@ -25,7 +25,7 @@ PORT     = 8090
 URL      = f"http://{HOST}:{PORT}/json-rpc" # API endpoint
 HEADERS  = {'Content-type': 'application/json', 'Accept': 'text/plain'}
 
-TRIGGER_PIN  = 17    # Define pin number
+TRIGGER_PIN  = 25    # Define pin number
 DEBOUNCE_MS  = 50    # Debounce time in milliseconds
 
 GPIO.setmode(GPIO.BCM) # Set up GPIO mode
