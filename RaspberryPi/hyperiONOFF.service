@@ -21,11 +21,11 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=pi
+User=hyperion
 Group=www-data
-WorkingDirectory=/home/pi/hyperiONOFF
-Environment="PATH=/home/pi/hyperiONOFF"
-ExecStart=/home/pi/venv/bin/python3 /home/pi/hyperiONOFF/hyperiONOFF.py
+WorkingDirectory=/home/hyperion/hyperiONOFF
+Environment="PATH=/home/hyperion/hyperiONOFF"
+ExecStart=/usr/bin/python3 /home/hyperion/hyperiONOFF/hyperiONOFF.py
 StandardError=journal
 
 Restart=on-failure
