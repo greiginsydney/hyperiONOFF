@@ -13,8 +13,8 @@
 
 [Unit]
 Description=hyperiONOFF script. Runs continuously, reading a GPIO pin & writing changes to Hyperion
-Requires=hyperion.service <TBC>
-After=hyperion.service <TBC>
+Requires=hyperion@root.service
+After=hyperion@root.service
 
 StartLimitIntervalSec=600
 StartLimitBurst=5
