@@ -25,7 +25,7 @@ User=hyperion
 Group=www-data
 WorkingDirectory=/home/hyperion/hyperiONOFF
 Environment="PATH=/home/hyperion/hyperiONOFF"
-ExecStart=/usr/bin/python3 /home/hyperion/hyperiONOFF/hyperiONOFF.py
+ExecStart=/usr/bin/python3 -u /home/hyperion/hyperiONOFF/hyperiONOFF.py
 StandardError=journal
 
 Restart=on-failure
