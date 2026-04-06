@@ -54,18 +54,25 @@ payloadOFF = {
 # ////////// FUNCTIONS ///////////
 # ////////////////////////////////
 
-def send_to_hyperion(TurnON):
-    """Send the appropriate payload to Hyperion based on pin state."""
-    try:
-        if TurnON:
-            response = requests.post(URL, json=payloadON, headers=HEADERS, timeout=5)
-        else:
-            response = requests.post(URL, json=payloadOFF, headers=HEADERS, timeout=5)
-        response.raise_for_status()
-        result = response.json()
-        print("Response:", json.dumps(result, indent=2))
-    except requests.exceptions.RequestException as e:
-        print("Error communicating with Hyperion:", e)
+def send_to_hyperion(TurnON, retries=5, delay=5):
+    """Send the appropriate payload to Hyperion, with retries."""
+    for attempt in range(1, retries + 1):
+        try:
+            if TurnON:
+                response = requests.post(URL, json=payloadON, headers=HEADERS, timeout=5)
+            else:
+                response = requests.post(URL, json=payloadOFF, headers=HEADERS, timeout=5)
+            response.raise_for_status()
+            result = response.json()
+            print("Response:", json.dumps(result, indent=2))
+            return True
+        except requests.exceptions.RequestException as e:
+            print(f"Attempt {attempt}/{retries} - Error communicating with Hyperion: {e}")
+            if attempt < retries:
+                print(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+    print("Failed to communicate with Hyperion after all retries")
+    return False
 
 
 def pin_changed(channel):
