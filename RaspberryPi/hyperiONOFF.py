@@ -124,16 +124,20 @@ class CecMonitor:
     cec-client is run in 'monitoring' mode (-m) so it doesn't announce itself as an
     active source on the CEC bus — it just listens passively.
 
-    Relevant CEC opcodes we watch for:
-      - 0x90  Report Power Status   (TV broadcasts its power state)
-      - 0x36  Standby               (TV going to standby)
-      - 0x04  Image View On         (TV waking up)
-      - 0x0D  Text View On          (TV waking up, text mode)
+    Opcodes observed on this Samsung TV:
+      - 0x36  Standby        — TV broadcasting that it is going to standby (TV OFF)
+      - 0x87  Give Vendor ID — TV polling devices on wake-up (TV ON)
+      - 0x90  Report Power Status — standard power status frame (kept as fallback)
 
-    We also watch for the "power status changed" lines that libCEC emits as plain text.
+    Note: this TV does not send 0x04 (Image View On) or 0x0D (Text View On) on wake.
+    Power-on is inferred from the 0x87 vendor ID poll that the TV broadcasts immediately
+    after waking, before any other traffic appears.
+
+    We also watch for the "power status changed" lines that libCEC emits as plain text,
+    though at -d 8 log level these may not appear.
     """
 
-    # libCEC emits these lines when it detects a power status change.
+    # libCEC plain-text power status changes (may appear at higher log levels)
     # Examples:
     #   "power status changed from 'standby' to 'on'"
     #   "power status changed from 'on' to 'standby'"
@@ -141,9 +145,17 @@ class CecMonitor:
         r"power status changed from '(\w[\w ]+)' to '(\w[\w ]+)'", re.IGNORECASE
     )
 
-    # CEC Report Power Status opcode (0x90) carries a parameter:
-    #   0x00 = on, 0x01 = standby, 0x02 = in transition standby→on, 0x03 = in transition on→standby
+    # CEC Report Power Status opcode (0x90) — kept as a fallback for other TV brands.
+    # Parameter: 0x00 = on, 0x01 = standby, 0x02 = transitioning to on, 0x03 = transitioning to standby
     REPORT_POWER_RE = re.compile(r">> ([\da-fA-F]{2}):([\da-fA-F]{2}):90:([\da-fA-F]{2})")
+
+    # 0x36 Standby — match the opcode only at end-of-frame or followed by a space/newline,
+    # to avoid false matches against :36: appearing mid-frame in vendor payloads.
+    STANDBY_RE = re.compile(r">> [\da-fA-F]{2}:36\s*$", re.IGNORECASE)
+
+    # 0x87 Give Device Vendor ID — TV broadcasts this to all devices immediately on wake.
+    # Format: >> 0f:87:VV:VV:VV  (VV = vendor ID bytes, e.g. 08:00:46 for Samsung)
+    VENDOR_ID_RE = re.compile(r">> [\da-fA-F]{2}:87:", re.IGNORECASE)
 
     POWER_ON_STATES  = {'on', 'in transition standby to on'}
     POWER_OFF_STATES = {'standby', 'in transition on to standby'}
@@ -195,7 +207,7 @@ class CecMonitor:
     def _parse_line(self, line):
         """Parse a single line of cec-client output for power state changes."""
 
-        # libCEC plain-text power status changes (most reliable)
+        # libCEC plain-text power status changes (appear at higher log levels)
         m = self.POWER_STATUS_RE.search(line)
         if m:
             new_state = m.group(2).lower()
@@ -206,7 +218,7 @@ class CecMonitor:
                 self._set_tv_on(False)
             return
 
-        # Raw CEC 0x90 Report Power Status frames
+        # Raw CEC 0x90 Report Power Status frames (fallback for other TV brands)
         m = self.REPORT_POWER_RE.search(line)
         if m:
             param = int(m.group(3), 16)
@@ -216,15 +228,17 @@ class CecMonitor:
             self._set_tv_on(powered)
             return
 
-        # Standby opcode (0x36): TV is going to standby
-        if ':36' in line and '>>' in line:
+        # 0x36 Standby — TV going to standby. Use regex to avoid matching :36:
+        # appearing mid-frame in Samsung vendor payloads.
+        if self.STANDBY_RE.search(line):
             print("CEC 0x36 Standby received → TV OFF")
             self._set_tv_on(False)
             return
 
-        # Image/Text View On opcodes (0x04, 0x0D): TV is waking
-        if (':04' in line or ':0d' in line or ':0D' in line) and '>>' in line:
-            print("CEC 0x04/0x0D View On received → TV ON")
+        # 0x87 Give Device Vendor ID — TV broadcasts this immediately on wake.
+        # This is the most reliable power-on signal for this Samsung TV.
+        if self.VENDOR_ID_RE.search(line):
+            print("CEC 0x87 Give Vendor ID received → TV ON")
             self._set_tv_on(True)
             return
 
