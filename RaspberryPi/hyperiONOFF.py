@@ -10,11 +10,13 @@
 # https://github.com/greiginsydney/hyperiONOFF
 # https://greiginsydney.com/hyperiONOFF
 
-
 import requests
 import json                         # For sending to Hyperion
 import RPi.GPIO as GPIO
 import time
+import subprocess
+import threading
+import re
 
 # ////////////////////////////////
 # /////////// STATICS ////////////
@@ -24,9 +26,11 @@ HOST     = "localhost"
 PORT     = 8090
 URL      = f"http://{HOST}:{PORT}/json-rpc" # API endpoint
 HEADERS  = {'Content-type': 'application/json', 'Accept': 'text/plain'}
-
 TRIGGER_PIN  = 25    # Define pin number
 DEBOUNCE_MS  = 50    # Debounce time in milliseconds
+
+# CEC: how long to wait (seconds) before assuming TV is off if no CEC traffic seen at startup
+CEC_STARTUP_TIMEOUT = 10
 
 GPIO.setmode(GPIO.BCM) # Set up GPIO mode
 GPIO.setup(TRIGGER_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -49,6 +53,14 @@ payloadOFF = {
     }
 }
 
+# ////////////////////////////////
+# ///////// SHARED STATE /////////
+# ////////////////////////////////
+
+# Both GPIO and CEC update these; a lock protects concurrent access.
+state_lock    = threading.Lock()
+gpio_active   = False   # True when GPIO pin is LOW (signal present)
+tv_on         = False   # True when CEC reports TV is powered on
 
 # ////////////////////////////////
 # ////////// FUNCTIONS ///////////
@@ -75,40 +87,212 @@ def send_to_hyperion(TurnON, retries=5, delay=5):
     return False
 
 
+def should_leds_be_on():
+    """Return True only if both the GPIO signal is active AND the TV is on."""
+    with state_lock:
+        return gpio_active and tv_on
+
+
+def update_leds(reason=""):
+    """Check combined state and send the appropriate command to Hyperion."""
+    leds_on = should_leds_be_on()
+    print(f"update_leds() called ({reason}): gpio_active={gpio_active}, tv_on={tv_on} → LEDs {'ON' if leds_on else 'OFF'}")
+    send_to_hyperion(TurnON=leds_on)
+
+
 def pin_changed(channel):
     """Callback fired by GPIO edge detection when the pin state changes."""
+    global gpio_active
     pin_state = GPIO.input(TRIGGER_PIN)
+    with state_lock:
+        gpio_active = (pin_state == GPIO.LOW)
     if pin_state == GPIO.LOW:
-        print("Pin LOW - sending ON")
-        send_to_hyperion(TurnON=True)
+        print("Pin LOW - signal present")
     else:
-        print("Pin HIGH - sending OFF")
-        send_to_hyperion(TurnON=False)
+        print("Pin HIGH - no signal")
+    update_leds(reason="GPIO change")
+
+
+# ////////////////////////////////
+# ///////// CEC MONITOR //////////
+# ////////////////////////////////
+
+class CecMonitor:
+    """
+    Runs cec-client in the background and watches its output for TV power state changes.
+
+    cec-client is run in 'monitoring' mode (-m) so it doesn't announce itself as an
+    active source on the CEC bus — it just listens passively.
+
+    Relevant CEC opcodes we watch for:
+      - 0x90  Report Power Status   (TV broadcasts its power state)
+      - 0x36  Standby               (TV going to standby)
+      - 0x04  Image View On         (TV waking up)
+      - 0x0D  Text View On          (TV waking up, text mode)
+
+    We also watch for the "power status changed" lines that libCEC emits as plain text.
+    """
+
+    # libCEC emits these lines when it detects a power status change.
+    # Examples:
+    #   "power status changed from 'standby' to 'on'"
+    #   "power status changed from 'on' to 'standby'"
+    POWER_STATUS_RE = re.compile(
+        r"power status changed from '(\w[\w ]+)' to '(\w[\w ]+)'", re.IGNORECASE
+    )
+
+    # CEC Report Power Status opcode (0x90) carries a parameter:
+    #   0x00 = on, 0x01 = standby, 0x02 = in transition standby→on, 0x03 = in transition on→standby
+    REPORT_POWER_RE = re.compile(r">> ([\da-fA-F]{2}):([\da-fA-F]{2}):90:([\da-fA-F]{2})")
+
+    POWER_ON_STATES  = {'on', 'in transition standby to on'}
+    POWER_OFF_STATES = {'standby', 'in transition on to standby'}
+
+    def __init__(self):
+        self._proc    = None
+        self._thread  = None
+        self._stop    = threading.Event()
+
+    def start(self):
+        """Launch cec-client and start the reader thread."""
+        try:
+            self._proc = subprocess.Popen(
+                ['cec-client', '-m', '-d', '8'],   # -m = monitor mode, -d 8 = log level notice
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1                           # line-buffered
+            )
+            self._thread = threading.Thread(target=self._reader, daemon=True, name="cec-reader")
+            self._thread.start()
+            print("CEC monitor started (cec-client pid:", self._proc.pid, ")")
+        except FileNotFoundError:
+            print("WARNING: cec-client not found. Install with: sudo apt install cec-utils")
+            print("         TV power state will be assumed ON — GPIO alone controls LEDs.")
+            self._set_tv_on(True)
+
+    def stop(self):
+        """Shut down cec-client cleanly."""
+        self._stop.set()
+        if self._proc:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        print("CEC monitor stopped.")
+
+    def _reader(self):
+        """Background thread: read cec-client stdout line by line."""
+        for line in self._proc.stdout:
+            if self._stop.is_set():
+                break
+            line = line.rstrip()
+            if not line:
+                continue
+            self._parse_line(line)
+
+    def _parse_line(self, line):
+        """Parse a single line of cec-client output for power state changes."""
+
+        # libCEC plain-text power status changes (most reliable)
+        m = self.POWER_STATUS_RE.search(line)
+        if m:
+            new_state = m.group(2).lower()
+            print(f"CEC power status: {m.group(1)} → {m.group(2)}")
+            if new_state in self.POWER_ON_STATES:
+                self._set_tv_on(True)
+            elif new_state in self.POWER_OFF_STATES:
+                self._set_tv_on(False)
+            return
+
+        # Raw CEC 0x90 Report Power Status frames
+        m = self.REPORT_POWER_RE.search(line)
+        if m:
+            param = int(m.group(3), 16)
+            # 0x00 = on, 0x02 = transitioning to on → treat as on
+            powered = param in (0x00, 0x02)
+            print(f"CEC 0x90 Report Power Status: param=0x{param:02X} → TV {'ON' if powered else 'OFF'}")
+            self._set_tv_on(powered)
+            return
+
+        # Standby opcode (0x36): TV is going to standby
+        if ':36' in line and '>>' in line:
+            print("CEC 0x36 Standby received → TV OFF")
+            self._set_tv_on(False)
+            return
+
+        # Image/Text View On opcodes (0x04, 0x0D): TV is waking
+        if (':04' in line or ':0d' in line or ':0D' in line) and '>>' in line:
+            print("CEC 0x04/0x0D View On received → TV ON")
+            self._set_tv_on(True)
+            return
+
+    def _set_tv_on(self, powered: bool):
+        """Update shared tv_on state and trigger LED update if it changed."""
+        global tv_on
+        with state_lock:
+            changed  = (tv_on != powered)
+            tv_on    = powered
+        if changed:
+            update_leds(reason="CEC TV power change")
+
+    def query_power_status(self):
+        """
+        Ask the TV to report its power status over CEC. Call once at startup
+        so we don't have to wait for the TV to broadcast spontaneously.
+        Send the 'pow' command to cec-client's stdin.
+        """
+        if self._proc and self._proc.stdin:
+            try:
+                self._proc.stdin.write("pow 0\n")
+                self._proc.stdin.flush()
+            except Exception as e:
+                print(f"Could not send CEC power query: {e}")
 
 
 # ////////////////////////////////
 # /////////// MAIN ///////////////
 # ////////////////////////////////
 
+cec = CecMonitor()
+
 try:
+    # Start CEC monitoring first so we know TV state before acting on GPIO
+    cec.start()
+
+    # Give cec-client a moment to initialise, then ask the TV its power state.
+    # This fills in tv_on before we read the GPIO pin, avoiding a false LED-off
+    # at startup if the TV is already on.
+    time.sleep(2)
+
     # Register edge detection callback (fires on both rising and falling edges)
     GPIO.add_event_detect(TRIGGER_PIN, GPIO.BOTH, callback=pin_changed, bouncetime=DEBOUNCE_MS)
 
-    # Read and act on the initial pin state at startup, so we don't have to
-    # wait for the first edge transition before sending the correct payload
+    # Read and act on the initial pin state at startup
     initial_state = GPIO.input(TRIGGER_PIN)
-    print("Startup pin state:", "LOW" if initial_state == GPIO.LOW else "HIGH")
-    send_to_hyperion(TurnON=(initial_state == GPIO.LOW))
+    with state_lock:
+        gpio_active = (initial_state == GPIO.LOW)
+    print("Startup pin state:", "LOW (active)" if gpio_active else "HIGH (inactive)")
+    print(f"Startup TV state:  {'ON' if tv_on else 'OFF (waiting up to ' + str(CEC_STARTUP_TIMEOUT) + 's for CEC response)'}")
 
-    print("Monitoring pin", TRIGGER_PIN, "- press Ctrl+C to exit")
+    # Wait briefly for CEC to report the TV's power state, then act regardless
+    deadline = time.time() + CEC_STARTUP_TIMEOUT
+    while not tv_on and time.time() < deadline:
+        time.sleep(0.5)
 
-    # Sleep indefinitely - the GPIO callback handles everything asynchronously
+    if not tv_on:
+        print("No CEC power-on response received at startup — assuming TV is off.")
+
+    update_leds(reason="startup")
+
+    print("Monitoring GPIO pin", TRIGGER_PIN, "and CEC bus — press Ctrl+C to exit")
     while True:
         time.sleep(1)
 
 except KeyboardInterrupt:
     print("Exiting...")
-
 finally:
+    cec.stop()
     GPIO.cleanup()
     print("GPIO cleaned up")
