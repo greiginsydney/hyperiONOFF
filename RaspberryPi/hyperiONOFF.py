@@ -38,8 +38,23 @@ DEBOUNCE_MS = 50    # Debounce time in milliseconds
 # problems on your setup. In GPIO-only mode the LEDs follow the GPIO pin alone.
 USE_CEC = True
 
-# CEC: how long to wait (seconds) for the startup power probe before assuming TV is off.
+# CEC: how long to wait (seconds) for each startup power probe attempt.
 CEC_STARTUP_TIMEOUT = 10
+
+# If the CEC startup probe cannot determine the TV's power state after all retries,
+# this setting controls the assumed state:
+#   "on"  — LEDs will be active at startup (correct if TV is usually on when Pi boots)
+#   "off" — LEDs will stay off until the next TV power event (safer/conservative default)
+# Any value other than "on" or "off" will be treated as "off" and logged.
+CEC_PROBE_FALLBACK = "off"
+
+# How many times to retry the CEC startup probe if the result is 'unknown'.
+# Valid range: 0-5. Values outside this range will be clamped to 2 and logged.
+CEC_PROBE_RETRIES = 3
+
+# Seconds to wait between CEC startup probe retries.
+# Valid range: 1-3. Values outside this range will be clamped to 2 and logged.
+CEC_PROBE_RETRY_DELAY = 2
 
 GPIO.setmode(GPIO.BCM) # Set up GPIO mode
 GPIO.setup(TRIGGER_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -61,6 +76,29 @@ payloadOFF = {
         "state": False
     }
 }
+
+# ////////////////////////////////
+# /////// VALIDATE STATICS ///////
+# ////////////////////////////////
+
+def validate_cec_settings():
+    """Validate and sanitise CEC-related constants. Logs a warning and applies
+    a safe default for any value that is out of range or of the wrong type."""
+    global CEC_PROBE_FALLBACK, CEC_PROBE_RETRIES, CEC_PROBE_RETRY_DELAY
+
+    if not isinstance(CEC_PROBE_FALLBACK, str) or CEC_PROBE_FALLBACK.lower() not in ('on', 'off'):
+        print(f"WARNING: CEC_PROBE_FALLBACK '{CEC_PROBE_FALLBACK}' is invalid (must be 'on' or 'off'). Defaulting to 'off'.")
+        CEC_PROBE_FALLBACK = 'off'
+    else:
+        CEC_PROBE_FALLBACK = CEC_PROBE_FALLBACK.lower()
+
+    if not isinstance(CEC_PROBE_RETRIES, int) or not (0 <= CEC_PROBE_RETRIES <= 5):
+        print(f"WARNING: CEC_PROBE_RETRIES '{CEC_PROBE_RETRIES}' is invalid (must be an integer 0-5). Defaulting to 2.")
+        CEC_PROBE_RETRIES = 2
+
+    if not isinstance(CEC_PROBE_RETRY_DELAY, (int, float)) or not (1 <= CEC_PROBE_RETRY_DELAY <= 3):
+        print(f"WARNING: CEC_PROBE_RETRY_DELAY '{CEC_PROBE_RETRY_DELAY}' is invalid (must be 1-3 seconds). Defaulting to 2.")
+        CEC_PROBE_RETRY_DELAY = 2
 
 # ////////////////////////////////
 # ///////// SHARED STATE /////////
@@ -202,37 +240,49 @@ class CecMonitor:
         mode (-s). This runs cec-client as a normal (non-monitor) client so it announces
         itself on the CEC bus and the TV responds to the 'pow 0' query.
 
-        Returns True if TV is on, False if standby, or None if the query fails or
-        the TV does not respond.
+        Retries up to CEC_PROBE_RETRIES times with CEC_PROBE_RETRY_DELAY seconds between
+        attempts if the result is unknown.
+
+        Returns True if TV is on, False if standby, or None if all attempts fail.
         """
-        print("CEC startup probe: querying TV power status...")
-        try:
-            result = subprocess.run(
-                ['cec-client', '-s', '-d', '8'],
-                input='pow 0\n',
-                capture_output=True,
-                text=True,
-                timeout=CEC_STARTUP_TIMEOUT
-            )
-            output = result.stdout + result.stderr
-            if self.PROBE_ON_RE.search(output):
-                print("CEC startup probe: TV is ON")
-                return True
-            elif self.PROBE_STANDBY_RE.search(output):
-                print("CEC startup probe: TV is in standby")
-                return False
-            else:
-                print("CEC startup probe: no power status response received")
+        attempts = CEC_PROBE_RETRIES + 1   # total attempts = 1 initial + retries
+        for attempt in range(1, attempts + 1):
+            suffix = f" (attempt {attempt}/{attempts})" if attempts > 1 else ""
+            print(f"CEC startup probe: querying TV power status{suffix}...")
+            try:
+                result = subprocess.run(
+                    ['cec-client', '-s', '-d', '8'],
+                    input='pow 0\n',
+                    capture_output=True,
+                    text=True,
+                    timeout=CEC_STARTUP_TIMEOUT
+                )
+                output = result.stdout + result.stderr
+                if self.PROBE_ON_RE.search(output):
+                    print("CEC startup probe: TV is ON")
+                    return True
+                elif self.PROBE_STANDBY_RE.search(output):
+                    print("CEC startup probe: TV is in standby")
+                    return False
+                else:
+                    print("CEC startup probe: no power status response received")
+                    if attempt < attempts:
+                        print(f"CEC startup probe: retrying in {CEC_PROBE_RETRY_DELAY}s...")
+                        time.sleep(CEC_PROBE_RETRY_DELAY)
+            except FileNotFoundError:
+                print("WARNING: cec-client not found. Install with: sudo apt install cec-utils")
                 return None
-        except FileNotFoundError:
-            print("WARNING: cec-client not found. Install with: sudo apt install cec-utils")
-            return None
-        except subprocess.TimeoutExpired:
-            print("CEC startup probe: timed out waiting for TV response")
-            return None
-        except Exception as e:
-            print(f"CEC startup probe failed: {e}")
-            return None
+            except subprocess.TimeoutExpired:
+                print("CEC startup probe: timed out waiting for TV response")
+                if attempt < attempts:
+                    print(f"CEC startup probe: retrying in {CEC_PROBE_RETRY_DELAY}s...")
+                    time.sleep(CEC_PROBE_RETRY_DELAY)
+            except Exception as e:
+                print(f"CEC startup probe failed: {e}")
+                return None
+
+        print(f"CEC startup probe: all {attempts} attempt(s) inconclusive.")
+        return None
 
     def start(self):
         """Launch cec-client in monitor mode and start the reader thread."""
@@ -343,6 +393,10 @@ class CecMonitor:
 # /////////// MAIN ///////////////
 # ////////////////////////////////
 
+# Validate CEC settings before use (logs warnings and applies safe defaults)
+if USE_CEC:
+    validate_cec_settings()
+
 cec = CecMonitor() if USE_CEC else None
 
 try:
@@ -357,9 +411,10 @@ try:
             elif probe_result is False:
                 tv_on = False
             else:
-                # No response — assume off; monitor will correct this on next TV event
-                tv_on = False
-                print("CEC startup probe inconclusive — assuming TV is off.")
+                # All probe attempts inconclusive — apply the configured fallback
+                fallback_on = (CEC_PROBE_FALLBACK == 'on')
+                tv_on = fallback_on
+                print(f"CEC startup probe inconclusive — applying CEC_PROBE_FALLBACK: TV assumed {'ON' if fallback_on else 'OFF'}.")
 
         # Phase 2: start the background monitor for ongoing event detection
         cec.start()
