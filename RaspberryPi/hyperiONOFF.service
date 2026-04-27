@@ -24,7 +24,7 @@ Type=simple
 User=hyperion
 Group=www-data
 WorkingDirectory=/home/hyperion/hyperiONOFF
-Environment="PATH=/home/hyperion/hyperiONOFF"
+Environment="PATH=/home/hyperion/hyperiONOFF:/usr/bin:/usr/local/bin:/bin"
 ExecStart=/usr/bin/python3 -u /home/hyperion/hyperiONOFF/hyperiONOFF.py
 StandardError=journal
 
