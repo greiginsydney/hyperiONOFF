@@ -26,8 +26,12 @@ HOST        = "localhost"
 PORT        = 8090
 URL         = f"http://{HOST}:{PORT}/json-rpc" # API endpoint
 HEADERS     = {'Content-type': 'application/json', 'Accept': 'text/plain'}
-TRIGGER_PIN = 25    # Define pin number
+TRIGGER_PIN = 25    # GPIO pin for video signal detection (pull-up, active LOW)
 DEBOUNCE_MS = 50    # Debounce time in milliseconds
+
+TOGGLE_PIN  = 24    # GPIO pin for the momentary toggle button (pull-up, active LOW)
+                    # Connect a momentary push-button between this pin and GND.
+                    # If unused, leave unconnected — the pull-up keeps the pin inert.
 
 # Set USE_CEC = True to enable TV power detection via HDMI CEC.
 # The Pi's HDMI output must be connected to a spare HDMI input on the TV.
@@ -58,6 +62,7 @@ CEC_PROBE_RETRY_DELAY = 2
 
 GPIO.setmode(GPIO.BCM) # Set up GPIO mode
 GPIO.setup(TRIGGER_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(TOGGLE_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 # JSON payload to enable LEDs
 payloadON = {
@@ -105,9 +110,11 @@ def validate_cec_settings():
 # ////////////////////////////////
 
 # Both GPIO and CEC update these; a lock protects concurrent access.
-state_lock  = threading.Lock()
-gpio_active = False   # True when GPIO pin is LOW (signal present)
-tv_on       = False   # True when CEC reports TV is powered on (always True if USE_CEC=False)
+state_lock      = threading.Lock()
+gpio_active     = False   # True when TRIGGER_PIN is LOW (signal present)
+tv_on           = False   # True when CEC reports TV is powered on (always True if USE_CEC=False)
+toggle_override = False   # True when the toggle button has manually set LED state
+leds_currently_on = False # Tracks the current LED state, used by toggle to know what to flip
 
 # ////////////////////////////////
 # ////////// FUNCTIONS ///////////
@@ -115,6 +122,7 @@ tv_on       = False   # True when CEC reports TV is powered on (always True if U
 
 def send_to_hyperion(TurnON, retries=5, delay=5):
     """Send the appropriate payload to Hyperion, with retries."""
+    global leds_currently_on
     for attempt in range(1, retries + 1):
         try:
             if TurnON:
@@ -124,6 +132,8 @@ def send_to_hyperion(TurnON, retries=5, delay=5):
             response.raise_for_status()
             result = response.json()
             print("Response:", json.dumps(result, indent=2))
+            with state_lock:
+                leds_currently_on = TurnON
             return True
         except requests.exceptions.RequestException as e:
             print(f"Attempt {attempt}/{retries} - Error communicating with Hyperion: {e}")
@@ -136,31 +146,52 @@ def send_to_hyperion(TurnON, retries=5, delay=5):
 
 def should_leds_be_on():
     """Return True if LEDs should be on.
+    Toggle override takes priority over all other inputs.
     In CEC mode: both GPIO must be active AND TV must be on.
     In GPIO-only mode: GPIO alone controls the LEDs (tv_on is always True).
     """
     with state_lock:
+        if toggle_override:
+            return leds_currently_on
         return gpio_active and tv_on
 
 
 def update_leds(reason=""):
     """Check combined state and send the appropriate command to Hyperion."""
     leds_on = should_leds_be_on()
-    print(f"update_leds() called ({reason}): gpio_active={gpio_active}, tv_on={tv_on} → LEDs {'ON' if leds_on else 'OFF'}")
+    print(f"update_leds() called ({reason}): gpio_active={gpio_active}, tv_on={tv_on}, toggle_override={toggle_override} → LEDs {'ON' if leds_on else 'OFF'}")
     send_to_hyperion(TurnON=leds_on)
 
 
 def pin_changed(channel):
-    """Callback fired by GPIO edge detection when the pin state changes."""
-    global gpio_active
+    """Callback fired by GPIO edge detection when TRIGGER_PIN state changes.
+    Clears any active toggle override so normal logic resumes."""
+    global gpio_active, toggle_override
     pin_state = GPIO.input(TRIGGER_PIN)
     with state_lock:
         gpio_active = (pin_state == GPIO.LOW)
+        if toggle_override:
+            print("TRIGGER_PIN changed — clearing toggle override.")
+            toggle_override = False
     if pin_state == GPIO.LOW:
         print("Pin LOW - signal present")
     else:
         print("Pin HIGH - no signal")
     update_leds(reason="GPIO change")
+
+
+def toggle_pressed(channel):
+    """Callback fired when the toggle button is pressed (TOGGLE_PIN falls LOW).
+    Flips the current LED state regardless of GPIO signal or CEC TV state,
+    and sets toggle_override so normal logic is suspended until the next
+    real input event."""
+    global toggle_override, leds_currently_on
+    with state_lock:
+        new_state = not leds_currently_on
+        leds_currently_on = new_state
+        toggle_override = True
+    print(f"Toggle button pressed → LEDs {'ON' if new_state else 'OFF'} (override active)")
+    send_to_hyperion(TurnON=new_state)
 
 
 # ////////////////////////////////
@@ -380,11 +411,15 @@ class CecMonitor:
             return
 
     def _set_tv_on(self, powered: bool):
-        """Update shared tv_on state and trigger LED update if it changed."""
-        global tv_on
+        """Update shared tv_on state and trigger LED update if it changed.
+        Clears any active toggle override so normal CEC logic resumes."""
+        global tv_on, toggle_override
         with state_lock:
             changed = (tv_on != powered)
             tv_on   = powered
+            if changed and toggle_override:
+                print("CEC TV power change — clearing toggle override.")
+                toggle_override = False
         if changed:
             update_leds(reason="CEC TV power change")
 
@@ -424,8 +459,11 @@ try:
             tv_on = True
         print("CEC disabled (USE_CEC=False) — running in GPIO-only mode.")
 
-    # Register edge detection callback (fires on both rising and falling edges)
+    # Register TRIGGER_PIN edge detection (fires on both rising and falling edges)
     GPIO.add_event_detect(TRIGGER_PIN, GPIO.BOTH, callback=pin_changed, bouncetime=DEBOUNCE_MS)
+
+    # Register TOGGLE_PIN edge detection (fires on falling edge only — button press)
+    GPIO.add_event_detect(TOGGLE_PIN, GPIO.FALLING, callback=toggle_pressed, bouncetime=DEBOUNCE_MS)
 
     # Read and act on the initial pin state at startup, so we don't have to
     # wait for the first edge transition before sending the correct payload
@@ -438,6 +476,7 @@ try:
     update_leds(reason="startup")
 
     mode_str = "GPIO pin " + str(TRIGGER_PIN) + " and CEC bus" if USE_CEC else "GPIO pin " + str(TRIGGER_PIN) + " only"
+    mode_str += f", toggle button on pin {TOGGLE_PIN}"
     print(f"Monitoring {mode_str} — press Ctrl+C to exit")
 
     while True:
