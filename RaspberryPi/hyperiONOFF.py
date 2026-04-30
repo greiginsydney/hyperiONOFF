@@ -110,11 +110,12 @@ def validate_cec_settings():
 # ////////////////////////////////
 
 # Both GPIO and CEC update these; a lock protects concurrent access.
-state_lock      = threading.Lock()
-gpio_active     = False   # True when TRIGGER_PIN is LOW (signal present)
-tv_on           = False   # True when CEC reports TV is powered on (always True if USE_CEC=False)
-toggle_override = False   # True when the toggle button has manually set LED state
-leds_currently_on = False # Tracks the current LED state, used by toggle to know what to flip
+state_lock            = threading.Lock()
+gpio_active           = False     # True when TRIGGER_PIN is LOW (signal present)
+tv_on                 = False     # True when CEC reports TV is powered on (always True if USE_CEC=False)
+toggle_override       = False     # True when the toggle button has manually set LED state
+leds_currently_on     = False     # Tracks the current LED state, used by toggle to know what to flip
+_toggle_pin_last_state = GPIO.HIGH # Tracks the last known state of TOGGLE_PIN for edge detection
 
 # ////////////////////////////////
 # ////////// FUNCTIONS ///////////
@@ -181,17 +182,24 @@ def pin_changed(channel):
 
 
 def toggle_pressed(channel):
-    """Callback fired when the toggle button is pressed (TOGGLE_PIN falls LOW).
-    Flips the current LED state regardless of GPIO signal or CEC TV state,
-    and sets toggle_override so normal logic is suspended until the next
-    real input event."""
-    global toggle_override, leds_currently_on
+    """Callback fired by GPIO edge detection on TOGGLE_PIN.
+    Tracks the pin's last known state and only acts on the falling edge
+    (HIGH → LOW = button press), ignoring the rising edge (button release)."""
+    global toggle_override, leds_currently_on, _toggle_pin_last_state
+    current_state = GPIO.input(TOGGLE_PIN)
     with state_lock:
-        new_state = not leds_currently_on
-        leds_currently_on = new_state
-        toggle_override = True
-    print(f"Toggle button pressed → LEDs {'ON' if new_state else 'OFF'} (override active)")
-    send_to_hyperion(TurnON=new_state)
+        last_state = _toggle_pin_last_state
+        _toggle_pin_last_state = current_state
+    # Only act on the falling edge (HIGH → LOW = button press)
+    if last_state == GPIO.HIGH and current_state == GPIO.LOW:
+        with state_lock:
+            new_state = not leds_currently_on
+            leds_currently_on = new_state
+            toggle_override = True
+        print(f"Toggle button pressed → LEDs {'ON' if new_state else 'OFF'} (override active)")
+        send_to_hyperion(TurnON=new_state)
+    else:
+        print("Toggle button: ignoring rising edge (button release)")
 
 
 # ////////////////////////////////
@@ -462,8 +470,8 @@ try:
     # Register TRIGGER_PIN edge detection (fires on both rising and falling edges)
     GPIO.add_event_detect(TRIGGER_PIN, GPIO.BOTH, callback=pin_changed, bouncetime=DEBOUNCE_MS)
 
-    # Register TOGGLE_PIN edge detection (fires on falling edge only — button press)
-    GPIO.add_event_detect(TOGGLE_PIN, GPIO.FALLING, callback=toggle_pressed, bouncetime=DEBOUNCE_MS)
+    # Register TOGGLE_PIN edge detection (fires on both edges; callback filters to falling only)
+    GPIO.add_event_detect(TOGGLE_PIN, GPIO.BOTH, callback=toggle_pressed, bouncetime=DEBOUNCE_MS)
 
     # Read and act on the initial pin state at startup, so we don't have to
     # wait for the first edge transition before sending the correct payload
