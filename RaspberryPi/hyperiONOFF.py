@@ -26,12 +26,11 @@ HOST        = "localhost"
 PORT        = 8090
 URL         = f"http://{HOST}:{PORT}/json-rpc" # API endpoint
 HEADERS     = {'Content-type': 'application/json', 'Accept': 'text/plain'}
-TRIGGER_PIN = 25    # GPIO pin for video signal detection (pull-up, active LOW)
-DEBOUNCE_MS = 50    # Debounce time in milliseconds
-
+TRIGGER_PIN = 25    # GPIO pin for USB-based video signal detection (pull-up, active LOW)
 TOGGLE_PIN  = 24    # GPIO pin for the momentary toggle button (pull-up, active LOW)
                     # Connect a momentary push-button between this pin and GND.
                     # If unused, leave unconnected — the pull-up keeps the pin inert.
+DEBOUNCE_MS = 50    # Debounce time in milliseconds
 
 # Set USE_CEC = True to enable TV power detection via HDMI CEC.
 # The Pi's HDMI output must be connected to a spare HDMI input on the TV.
@@ -54,7 +53,7 @@ CEC_PROBE_FALLBACK = "off"
 
 # How many times to retry the CEC startup probe if the result is 'unknown'.
 # Valid range: 0-5. Values outside this range will be clamped to 2 and logged.
-CEC_PROBE_RETRIES = 3
+CEC_PROBE_RETRIES = 2
 
 # Seconds to wait between CEC startup probe retries.
 # Valid range: 1-3. Values outside this range will be clamped to 2 and logged.
@@ -110,18 +109,18 @@ def validate_cec_settings():
 # ////////////////////////////////
 
 # Both GPIO and CEC update these; a lock protects concurrent access.
-state_lock            = threading.Lock()
-gpio_active           = False     # True when TRIGGER_PIN is LOW (signal present)
-tv_on                 = False     # True when CEC reports TV is powered on (always True if USE_CEC=False)
-toggle_override       = False     # True when the toggle button has manually set LED state
-leds_currently_on     = False     # Tracks the current LED state, used by toggle to know what to flip
+state_lock             = threading.Lock()
+gpio_active            = False     # True when TRIGGER_PIN is LOW (signal present)
+tv_on                  = False     # True when CEC reports TV is powered on (always True if USE_CEC=False)
+toggle_override        = False     # True when the toggle button has manually set LED state
+leds_currently_on      = False     # Tracks the current LED state, used by toggle to know what to flip
 _toggle_pin_last_state = GPIO.HIGH # Tracks the last known state of TOGGLE_PIN for edge detection
 
 # ////////////////////////////////
 # ////////// FUNCTIONS ///////////
 # ////////////////////////////////
 
-def send_to_hyperion(TurnON, retries=5, delay=5):
+def send_to_hyperion(TurnON, retries=2, delay=2):
     """Send the appropriate payload to Hyperion, with retries."""
     global leds_currently_on
     for attempt in range(1, retries + 1):
